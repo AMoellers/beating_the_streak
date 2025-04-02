@@ -1,0 +1,794 @@
+---
+title: "Beating the Streak"
+author: 
+  name: "Austin Moellers"
+  email: "AustinMoellers@Outlook.com"
+date: "04/02/2025"
+format:
+  html:
+    toc: true
+    number-sections: false
+    smooth-scroll: true
+    code-copy: false
+knitr:
+  opts_chunk: 
+    warning: false
+    message: false
+    out-width: 100%
+execute: 
+  cache: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| include: false
+
+library(zoo)
+library(broom)
+library(knitr)
+library(baseballr)
+library(tidyverse)
+```
+
+```{r}
+#| include: false
+
+chadwick <- chadwick_player_lu()
+
+retro_2021 <- read_rds("data/retro_2021.rds")
+retro_2022 <- read_rds("data/retro_2022.rds")
+retro_2023 <- read_rds("data/retro_2023.rds")
+retro_2024 <- read_rds("data/retro_2024.rds")
+retro_four <- bind_rows(retro_2021, retro_2022, retro_2023, retro_2024) |>
+  select(game_id, bat_home_id, bat_id, bat_hand_cd, pit_id, pit_hand_cd, bat_event_fl, ab_fl, sf_fl, h_fl)
+
+sc_batters <- 2021:2024 |>
+  map(\(x) statcast_leaderboards(leaderboard = "expected_statistics", year = x, min_pa = "q", player_type = "batter")) |>
+  bind_rows() |>
+  rename(player = `last_name, first_name`) |>
+  select(year, player_id, player, pa, bip, ba, est_ba, slg, est_slg, woba, est_woba)
+
+sc_pitchers <- 2021:2024 |>
+  map(\(x) statcast_leaderboards(leaderboard = "expected_statistics", year = x, min_pa = "q", player_type = "pitcher")) |>
+  bind_rows() |>
+  rename(player = `last_name, first_name`) |>
+  select(year, player_id, player, pa, bip, ba, est_ba, slg, est_slg, woba, est_woba)
+
+statcast_est <- bind_rows(sc_batters, sc_pitchers)
+
+statcast_2023 <- read_rds("data/statcast_2023.rds")
+statcast_2024 <- read_rds("data/statcast_2024.rds")
+statcast_two <- bind_rows(statcast_2023, statcast_2024) |>
+  select(game_type, game_date, pitch_type, release_speed, batter, pitcher, events, estimated_ba_using_speedangle)
+```
+
+## What is "Beat the Streak"?
+
+[Beat the Streak](https://www.mlb.com/apps/beat-the-streak) (BTS) is a yearly contest run by MLB where contestants are tasked with selecting up to two batters per day that they hope will get a hit on that day. The ultimate goal is to surpass [Joe DiMaggio](https://www.baseball-reference.com/players/d/dimagjo01.shtml)'s all-time best [56-game hitting streak](https://en.wikipedia.org/wiki/Joe_DiMaggio%27s_56-game_hitting_streak) and claim the elusive $5,600,000 grand prize.
+
+Although the contest was introduced in 2001, the all-time record is a hit-streak of 51 by both "Robert Mosley" and "Rmares483". This begs the question, will the contest ever be beaten? and is it even possible?
+
+## Strategy
+
+When it comes to BTS, everyone is going to have their own strategy for making selections. Some people may only make a couple selections a week, while others may choose two batters every day. Some people may base their choices on statistics like batting average (BA) or earned run average (ERA), while others may look at expected batting average (xBA) or walk rate (BB%). Additionally, keen contestants may consider others factors like weather or bullpen composition.
+
+These are some of the variables that I consider when making BTS predictions, sorted roughly by most to least important.
+
+- Batter strength (high xBA, low BB%)
+- Starting pitcher strength (high xBA, low BB%, low K%)
+- Park factors
+- Batter / starting pitcher matchup (handedness, history)
+- Elemental factors (temperature, wind, humidity)
+- Bullpen strength & availability
+- Lineup position
+
+I also generally select two batters every day using the "Double Down Feature".
+
+## Datasets
+
+The most important dataset for this analysis is the [Retrosheet](https://www.retrosheet.org/game.htm) play-by-play data. This data includes the information necessary to determine which batters were available to select on which days and whether they were successful in acquiring a hit. This data was obtained using the `abdwr3edata::parse_retrosheet_pbp()` function.
+
+```{r}
+#| echo: false
+
+retro_four |>
+  slice_sample(n = 5) |>
+  kable()
+```
+
+The next dataset is the [Baseball Savant](https://baseballsavant.mlb.com) "expected statistics" leaderboard which includes the true and expected batting averages, on-base percentages, slugging percentages, and weighted on-base averages for qualified batters and pitchers. This data was acquired using the `baseballr::statcast_leaderboards()` function.
+
+```{r}
+#| echo: false
+
+statcast_est |>
+  slice_sample(n = 5) |>
+  kable()
+```
+
+Finally, the pitch-by-pitch dataset from [Baseball Savant](https://baseballsavant.mlb.com) provides information on every pitch thrown during an MLB season. This data was acquired using the `baseballr::statcast_search()` function.
+
+```{r}
+#| echo: false
+
+statcast_two |>
+  filter(events != "") |>
+  slice_sample(n = 5) |>
+  kable()
+```
+
+```{r}
+#| include: false
+
+sc_retro <- chadwick |>
+  mutate(player = case_match(
+    name_suffix,
+    "" ~ paste(name_first, name_last),
+    .default = paste(name_first, name_last, name_suffix)
+  )) |>
+  select(player, key_mlbam, key_retro) |>
+  drop_na(key_mlbam)
+
+retro_four <- retro_four |>
+  left_join(sc_retro, by = join_by(bat_id == key_retro), keep = TRUE) |>
+  left_join(sc_retro, by = join_by(pit_id == key_retro), keep = TRUE, suffix = c("_bat", "_pit"))
+
+matchups <- retro_four |>
+  group_by(game_id, bat_home_id) |>
+  filter(bat_event_fl == TRUE) |>
+  slice_head(n = 9) |>
+  select(game_id, key_mlbam_bat) |>
+  left_join(retro_four) |>
+  mutate(key_mlbam_pit = first(key_mlbam_pit), pit_hand_cd = first(pit_hand_cd)) |>
+  ungroup() |>
+  group_by(game_id, key_mlbam_bat) |>
+  summarize(
+    n = sum(bat_event_fl),
+    ab = sum(ab_fl),
+    sf = sum(sf_fl),
+    h = sum(if_else(h_fl > 0, TRUE, FALSE)),
+    id_bat = first(key_mlbam_bat),
+    batter = first(player_bat),
+    hand_bat = as_factor(first(bat_hand_cd)),
+    id_pit = first(key_mlbam_pit),
+    pitcher = first(player_pit),
+    hand_pit = as_factor(first(pit_hand_cd))
+  ) |>
+  mutate(
+    pass = if_else(ab + sf == 0, TRUE, FALSE),
+    h_fl = if_else(pass == FALSE & h >= 1, TRUE, FALSE),
+    park = as_factor(str_sub(game_id, 1, 3)),
+    date = ymd(str_sub(game_id, 4, 11)),
+    year = year(date)
+  )
+
+matchups <- matchups |>
+  left_join(sc_batters, by = join_by(id_bat == player_id, year))
+
+matchups <- matchups |>
+  left_join(sc_pitchers, by = join_by(id_pit == player_id, year), suffix = c("_bat", "_pit"))
+
+matchups <- matchups |>
+  select(game_id, date, park, id_bat, batter, hand_bat, est_ba_bat, id_pit, pitcher, hand_pit, est_ba_pit, pass, h_fl) |>
+  ungroup()
+```
+
+To create a data frame of all possible BTS selections, the play-by-play data is summarized and merged with the Statcast leaderboards. Along with the batters available for selection, this data frame includes the date, park, opposing starting pitcher, handedness for both players, season xBA for both players, and a flag for whether the player acquired a hit.
+
+```{r}
+#| echo: false
+
+matchups |>
+  filter(!is.na(est_ba_bat), !is.na(est_ba_pit)) |>
+  select(-c(game_id, id_bat, id_pit, pass)) |>
+  slice_sample(n = 5) |>
+  kable()
+```
+
+## 2024 Insights
+
+Before attempting to create a model, here is a look at the top/bottom ten batters, pitchers, and parks that had the highest / lowest success rates for the 2024 MLB season.
+
+[Bobby Witt Jr.](https://www.baseball-reference.com/players/w/wittbo02.shtml) was by far the best overall choice in 2024 with at least one hit in almost 80% of the games they played. Having [Ty Blach](https://www.baseball-reference.com/players/b/blachty01.shtml) on the mound was advantageous for BTS selections, as almost 75% of opposing batters got a hit in games where they started. Unsurprisingly, [Coors Field](https://www.baseball-reference.com/bullpen/Coors_Field) was the ideal park for BTS with almost 70% of batters acquiring a hit in games played in the Rocky Mountains.
+
+```{r}
+#| echo: false
+#| layout-ncol: 3
+#| label: good-choices
+#| tbl-cap:
+#|   - "Batters"
+#|   - "Pitchers"
+#|   - "Parks"
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(batter) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  filter(n >= 100) |>
+  arrange(-prop) |>
+  slice_head(n = 10) |>
+  kable()
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(pitcher) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  filter(n >= 100) |>
+  arrange(-prop) |>
+  slice_head(n = 10) |>
+  kable()
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(park) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  arrange(-prop) |>
+  slice_head(n = 10) |>
+  kable()
+```
+
+If you ever see [Mitch Garver](https://www.baseball-reference.com/players/g/garvemi01.shtml) against [Blake Snell](https://www.baseball-reference.com/players/s/snellbl01.shtml) at [T-Mobile Park](https://www.baseball-reference.com/bullpen/T-Mobile_Park), there will likely be some better options.
+
+```{r}
+#| echo: false
+#| layout-ncol: 3
+#| label: bad-choices
+#| tbl-cap:
+#|   - "Batters"
+#|   - "Pitchers"
+#|   - "Parks"
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(batter) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  filter(n >= 100) |>
+  arrange(prop) |>
+  slice_head(n = 10) |>
+  kable()
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(pitcher) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  filter(n >= 100) |>
+  arrange(prop) |>
+  slice_head(n = 10) |>
+  kable()
+
+matchups |>
+  filter(date >= "2024-01-01") |>
+  group_by(park) |>
+  summarize(
+    n = n(),
+    h = sum(h_fl),
+    prop = round(h / n, 3)
+  ) |>
+  arrange(prop) |>
+  slice_head(n = 10) |>
+  kable()
+```
+
+## Modelling
+
+It is clear that there are many factors that influence whether a batter obtains a hit in any particular game. To keep it simple, this binomial model will use the xBA of the batter and starting pitcher, the handedness of the batter and starting pitcher, and the park that the game was played in to produce a probability that the batter gets a hit. Since simulation will be done on the 2024 season, the model will use data from 2021 through 2023.
+
+```{r}
+#| include: false
+
+matchups_three <- matchups |>
+  filter(date <= "2023-12-31") |>
+  drop_na(est_ba_bat, est_ba_pit)
+
+m_bts <- glm(h_fl ~ est_ba_bat + est_ba_pit + hand_bat * hand_pit + park,
+  family = "binomial", data = matchups_three
+)
+```
+
+Some variables will have a greater impact than others, and this can be quantified by the estimate and p-values for each term. By far and away the most important variables are the xBA for the batter and pitcher, but every variable used in this model is significant.
+
+A list of the franchise/team IDs can be found [here](https://www.retrosheet.org/TEAMABR.TXT).
+
+```{r}
+#| echo: false
+#| layout-ncol: 3
+#| label: model-terms
+#| tbl-cap:
+#|   - "Handedness"
+#|   - "Hitter Friendly Parks"
+#|   - "Pitcher Friendly Parks"
+
+tidy(m_bts) |>
+  filter(!str_starts(term, "park")) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  select(term, estimate, p.value) |>
+  kable()
+
+tidy(m_bts) |>
+  arrange(-statistic) |>
+  filter(str_starts(term, "park")) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  select(term, estimate, p.value) |>
+  slice_head(n = 6) |>
+  kable()
+
+tidy(m_bts) |>
+  arrange(statistic) |>
+  filter(str_starts(term, "park")) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  select(term, estimate, p.value) |>
+  slice_head(n = 6) |>
+  kable()
+```
+
+In the five matchups most likely to result in a hit, [Ronald Acuña Jr.](https://www.baseball-reference.com/players/a/acunaro01.shtml) was the batter for each of them. The model predicts that these selections had almost a 90% chance of resulting in a hit.
+
+```{r}
+#| echo: false
+
+matchups <- matchups |>
+  mutate(prob = predict(m_bts, matchups, type = "response"))
+
+matchups |>
+  arrange(-prob) |>
+  select(-c(game_id, id_bat, id_pit)) |>
+  mutate(prob = round(prob, 3)) |>
+  slice_head(n = 5) |>
+  kable()
+```
+
+Conversely, the least likely selections are headlined by [Cristian Javier](https://www.baseball-reference.com/players/j/javiecr01.shtml), [Shane McClanahan](https://www.baseball-reference.com/players/m/mcclash01.shtml), and [Jacob deGrom](https://www.baseball-reference.com/players/d/degroja01.shtml). The probability of a hit can fall as low as 33.5% for these selections.
+
+```{r}
+#| echo: false
+
+matchups |>
+  arrange(prob) |>
+  select(-c(game_id, id_bat, id_pit, pass)) |>
+  mutate(prob = round(prob, 3)) |>
+  slice_head(n = 5) |>
+  kable()
+```
+
+If all the advice above is ignored, and purely random selections are made, the first five days of selections for the 2024 season could look something like this.
+
+```{r}
+#| echo: false
+
+random_selections <- matchups |>
+  filter(date >= "2024-03-28", !is.na(prob)) |>
+  group_by(date) |>
+  slice_sample(n = 1)
+
+random_selections |>
+  select(-c(game_id, id_bat, id_pit, pass)) |>
+  mutate(prob = round(prob, 3)) |>
+  ungroup() |>
+  slice_head(n = 5) |>
+  kable()
+```
+
+```{r}
+#| include: false
+
+add_streaks <- function(df) {
+  df <- df |>
+    group_by(date) |>
+    summarize(
+      n = n(),
+      passes = sum(pass),
+      hits = sum(h_fl)
+    ) |>
+    mutate(
+      streak = 0,
+      dead = if_else(n > passes + hits, TRUE, FALSE)
+    ) |>
+    right_join(df, by = join_by(date))
+
+  for (i in 1:nrow(df)) {
+    if (pluck(df, "dead", i) == TRUE) {
+      pluck(df, "streak", i) <- 0
+    } else if (i == 1 & pluck(df, "pass", i) == TRUE) {
+      pluck(df, "streak", i) <- 0
+    } else if (i == 1 & pluck(df, "h_fl", i) == TRUE) {
+      pluck(df, "streak", i) <- 1
+    } else if (pluck(df, "pass", i) == TRUE) {
+      pluck(df, "streak", i) <- pluck(df, "streak", i - 1)
+    } else if (pluck(df, "h_fl", i) == TRUE) {
+      pluck(df, "streak", i) <- pluck(df, "streak", i - 1) + 1
+    }
+  }
+  df
+}
+```
+
+```{r}
+#| include: false
+
+random_selections <- random_selections |>
+  add_streaks()
+
+best_streak_random <- random_selections |>
+  pull(streak) |>
+  max()
+```
+
+The streaks for these selections can be visualized using a stairstep plot. This selection method is clearly not very good, since the highest streak for the season is only `{r} best_streak_random`.
+
+```{r}
+#| echo: false
+#| label: fig-step-random
+#| fig-cap: "Stairstep plot of the current streak for a set of random selections over the course of the 2024 season."
+
+random_selections |>
+  ggplot(aes(x = date, y = streak)) +
+  geom_step() +
+  scale_y_continuous(breaks = scales::breaks_pretty()) +
+  labs(x = "Date", y = "Streak")
+```
+
+```{r}
+#| echo: false
+
+best_winning_selections <- matchups |>
+  filter(date >= "2024-03-28", pass == FALSE, h_fl == TRUE) |>
+  arrange(-prob) |>
+  group_by(date) |>
+  slice_head(n = 2) |>
+  ungroup()
+
+best_start_day <- best_winning_selections |>
+  mutate(roll_prob = rollmean(x = prob, k = 57, align = "left", fill = NA)) |>
+  arrange(-roll_prob) |>
+  pluck("date", 1)
+
+best_57 <- best_winning_selections |>
+  arrange(date) |>
+  filter(date >= best_start_day) |>
+  slice_head(n = 57)
+
+chance_57 <- 1 / prod(best_57$prob)
+```
+
+This is the "best" set of selections that results in a record 57 hit-streak. In the dream scenario where someone made these selections, taking the product of the probabilities gives an estimate for the chance that they all resulted in a hit of 1 in `{r} format(chance_57, scientific = FALSE, big.mark = ",")`.
+
+```{r}
+#| echo: false
+
+best_57 |>
+  select(-c(game_id, id_bat, id_pit, pass)) |>
+  mutate(prob = round(prob, 3)) |>
+  kable()
+```
+
+## Simulation
+
+The probabilities used in the previous examples are based on a model with each player's 2024 xBA. Since this information would not be available to someone making their 2024 selections, the player's 250 AB rolling xBA will be used as an estimate in the simulations.
+
+```{r}
+#| include: false
+
+statcast_roll <- statcast_two |>
+  arrange(game_date) |>
+  filter(
+    events %in% c(
+      "double", "double_play", "field_error", "field_out", "fielders_choice",
+      "fielders_choice_out", "force_out", "grounded_into_double_play",
+      "home_run", "sac_fly", "sac_fly_double_play", "single", "strikeout",
+      "strikeout_double_play", "triple", "triple_play"
+    ),
+    game_type == "R"
+  ) |>
+  mutate(
+    estimated_ba_using_speedangle = case_when(
+      !is.na(estimated_ba_using_speedangle) == TRUE ~ estimated_ba_using_speedangle,
+      events %in% c("double", "home_run", "single", "triple") ~ 1,
+      .default = 0
+    )
+  ) |>
+  select(game_date, batter, pitcher, estimated_ba_using_speedangle) |>
+  group_by(batter) |>
+  mutate(rolling_est_ba_bat = rollmean(
+    lag(estimated_ba_using_speedangle),
+    k = 250, align = "right", fill = NA
+  )) |>
+  ungroup() |>
+  group_by(pitcher) |>
+  mutate(rolling_est_ba_pit = rollmean(
+    lag(estimated_ba_using_speedangle),
+    k = 250, align = "right", fill = NA
+  )) |>
+  ungroup()
+
+statcast_pitchers <- statcast_roll |>
+  group_by(pitcher, game_date) |>
+  summarize(
+    game_date = first(game_date),
+    est_ba_pit = first(rolling_est_ba_pit)
+  ) |>
+  drop_na(est_ba_pit) |>
+  filter(game_date >= "2024-01-01")
+
+statcast_batters <- statcast_roll |>
+  group_by(batter, game_date) |>
+  summarize(
+    game_date = first(game_date),
+    est_ba_bat = first(rolling_est_ba_bat)
+  ) |>
+  drop_na(est_ba_bat) |>
+  filter(game_date >= "2024-01-01")
+
+matchups_2024 <- matchups |>
+  filter(date >= "2024-03-28") |>
+  select(-c(est_ba_pit, est_ba_bat, prob)) |>
+  left_join(statcast_batters, by = join_by(date == game_date, id_bat == batter)) |>
+  left_join(statcast_pitchers, by = join_by(date == game_date, id_pit == pitcher))
+
+matchups_2024 <- matchups_2024 |>
+  mutate(prob = predict(m_bts, matchups_2024, type = "response")) |>
+  drop_na(prob)
+```
+
+With recalculated probabilities, sets of selections can be generated with the same information that would be available to contestants during the 2024 BTS contest. Before that, here is a look at the distribution of hit probabilities for the 2024 season.
+
+```{r}
+#| echo: false
+#| label: fig-histogram-probs
+#| fig-cap: "Histogram of hit probabilities for all possible selections in the 2024 season."
+
+matchups_2024 |>
+  ggplot(aes(x = prob)) +
+  geom_histogram(bins = 40) +
+  labs(x = "Hit Probability", y = "Count")
+```
+
+```{r}
+#| include: false
+
+r_bts <- function(df, per_day = 2) {
+  selections <- df |>
+    group_by(date) |>
+    slice_sample(n = per_day, weight_by = prob) |>
+    add_streaks() |>
+    select(game_id, date, park, pitcher, est_ba_pit, batter, est_ba_bat, pass, h_fl, streak, prob)
+  return(selections)
+}
+
+bts <- function(matchups = matchups_2024, players = 10, min_prob = 0.7, per_day = 2, min_choices = 1) {
+  df <- matchups |>
+    filter(prob >= min_prob) |>
+    count(date, name = "daily_choices") |>
+    filter(daily_choices >= min_choices) |>
+    left_join(matchups, by = join_by(date)) |>
+    filter(prob >= min_prob)
+  selections <- 1:players |>
+    map(\(x) r_bts(df = df, per_day = per_day)) |>
+    bind_rows(.id = "player")
+  return(selections)
+}
+```
+
+For analysis, 15,000 sets of selections are simulated. Selections are made with the following criteria:
+
+- Two batters will be selected each day.
+- Only batters with a hit probability of at least 67.5% will be eligible for selection.
+- The chance that a batter is selected is proportional to their hit probability. E.g. a batter with a hit probability of 0.75 is 50% more likely to be selected than a batter with a hit probability of 0.50.
+
+```{r}
+#| include: false
+
+sim_15000_double <- read_rds("sims/sim_15000_double.rds")
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+set.seed(162)
+sim_1000_3 <- bts(matchups_2024, players = 1000, per_day = 1, min_prob = 0.3)
+sim_1000_5 <- bts(matchups_2024, players = 1000, per_day = 1, min_prob = 0.5)
+sim_1000_7 <- bts(matchups_2024, players = 1000, per_day = 1, min_prob = 0.7)
+sim_1000_three <- bind_rows(sim_1000_3, sim_1000_5, sim_1000_7,
+  .id = "sim"
+)
+
+sim_summary <- sim_1000_three |>
+  group_by(sim, player) |>
+  summarize(
+    n = n(),
+    sum_h = sum(h_fl),
+    rate = sum_h / n,
+    max_streak = max(streak)
+  )
+
+sim_summary |>
+  ggplot(aes(x = max_streak, y = sim)) +
+  geom_boxplot() +
+  labs(x = "Longest Streak")
+
+sim_summary |>
+  ggplot(aes(x = max_streak)) +
+  geom_bar() +
+  facet_wrap(~sim)
+
+sim_summary |>
+  ggplot(aes(x = rate, y = max_streak, colour = sim)) +
+  geom_point()
+
+sim_10000 <- bts(matchups_2024, players = 10000)
+```
+
+In the simulations, these were the most selected batters, pitchers, and parks. The list of batters is unsurprisingly correlated to batters with a high xBA. [Juan Soto](https://www.baseball-reference.com/players/s/sotoju01.shtml), [Bobby Witt Jr.](https://www.baseball-reference.com/players/w/wittbo02.shtml), and [Vladimir Guerrero Jr.](https://www.baseball-reference.com/players/g/guerrvl02.shtml) were the top three batters by xBA in 2024. Similarly, the pitchers on this list all had a high xBA in 2024, but there is a bias towards Rockies pitchers since they pitch half their games at [Coors Field](https://www.baseball-reference.com/bullpen/Coors_Field), which is by far the most selected park.
+
+```{r}
+#| echo: false
+#| layout-ncol: 3
+#| label: most-selected
+#| tbl-cap:
+#|   - "Batters"
+#|   - "Pitchers"
+#|   - "Park"
+
+sim_15000_double |>
+  count(batter) |>
+  arrange(-n) |>
+  slice_head(n = 10) |>
+  kable()
+
+sim_15000_double |>
+  count(pitcher) |>
+  arrange(-n) |>
+  slice_head(n = 10) |>
+  kable()
+
+sim_15000_double |>
+  count(park) |>
+  arrange(-n) |>
+  slice_head(n = 10) |>
+  kable()
+```
+
+The sad reality of BTS is that even with a "decent" strategy, most contestants will top out at a streak of between 10 and 14.
+
+```{r}
+#| echo: false
+#| label: fig-bar-streaks
+#| fig-cap: "Bar graph of the longest streaks for simulated selections of the 2024 season."
+
+sim_15000_double |>
+  group_by(player) |>
+  summarize(max_streak = max(streak)) |>
+  ggplot(aes(x = max_streak)) +
+  geom_bar() +
+  labs(x = "Longest Streak", y = "Count")
+```
+
+This is the reality even though contestants can reasonably maintain a success rate of 70% or higher.
+
+```{r}
+#| echo: false
+#| label: fig-histogram-success-rate
+#| fig-cap: "Histogram of success rates for simulated selections of the 2024 season."
+
+sim_15000_double |>
+  group_by(player) |>
+  summarize(
+    n = n(),
+    hits = sum(h_fl),
+    prop = hits / n
+  ) |>
+  ggplot(aes(x = prop)) +
+  geom_histogram(bins = 25) +
+  labs(x = "Success Rate", y = "Count")
+```
+
+It's well understood that the average contestant is extremely unlikely to even come close to the 57 hit-streak goal, but what was the longest streak of the 15,000 simulations?
+
+```{r}
+#| echo: false
+#| label: fig-step-best-sim
+#| fig-cap: "Stairstep plot of the current streak for the best simulation of the 2024 season."
+
+sim_15000_double |>
+  group_by(player) |>
+  summarize(
+    max_streak = max(streak)
+  ) |>
+  arrange(-max_streak) |>
+  slice_head(n = 1) |>
+  left_join(sim_15000_double, by = join_by(player)) |>
+  ggplot(aes(x = date, y = streak)) +
+  geom_step()
+
+best_streak_sims <- sim_15000_double |>
+  group_by(player) |>
+  summarize(
+    max_streak = max(streak)
+  ) |>
+  arrange(-max_streak) |>
+  pluck("max_streak", 1)
+```
+
+The best simulation was able to reach a streak of `{r} best_streak_sims`, well short of the 57 necessary to claim the grand prize.
+
+## Is the streak beatable?
+
+```{r}
+#| include: false
+
+daily_win_chance <- matchups_2024 |>
+  filter(prob >= 0.675) |>
+  group_by(date) |>
+  summarize(
+    tot_prob = sum(prob)
+  ) |>
+  left_join(matchups_2024, by = join_by(date)) |>
+  filter(prob >= 0.675) |>
+  mutate(
+    pick_rate = prob / tot_prob,
+    val = if_else(h_fl == TRUE, pick_rate, 0)
+  ) |>
+  group_by(date) |>
+  summarize(
+    success_rate = sum(val),
+    success_rate_2 = sum(val)^2
+  ) |>
+  mutate(
+    win_prob = rollapply(success_rate, width = 57, align = "left", FUN = prod, fill = NA),
+    win_prob_2 = (rollapply(success_rate_2, width = 28, align = "left", FUN = prod, fill = NA)) / lead(success_rate_2, 28)
+  )
+
+win_chance_double <- sim_15000_double |>
+  filter(row_number() %% 2 == 1) |>
+  mutate(start_streak = lag(streak, default = 0), .after = streak) |>
+  left_join(daily_win_chance, by = join_by(date)) |>
+  drop_na() |>
+  filter(start_streak == 0) |>
+  group_by(player) |>
+  summarize(
+    n = n(),
+    win_prob = sum(win_prob_2)
+  )
+
+grand_prize_rate <- win_chance_double |>
+  mutate(win_rate = 1 / win_prob) |>
+  pull(win_rate) |>
+  mean()
+```
+
+Now that all hopes and dreams of winning have been crushed, what is roughly the chance of a contestant beating the streak using this strategy? By using the simulations and calculating the chance of a success of any given day, the approximate chance of a contestant beating the streak with this strategy in 2024 was 1 in `{r} format(grand_prize_rate, scientific = FALSE, big.mark = ",")`. Still better than zero i guess...
+
+```{r}
+#| echo: false
+#| label: fig-histogram-win-rate
+#| fig-cap: "Histogram of win rates for simulated selections of the 2024 season."
+
+win_chance_double |>
+  ggplot(aes(x = 1 / win_prob)) +
+  geom_histogram() +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(x = "Win Rate (1 in X)", y = "Count")
+```
+
+Thank you to anyone for reading and good luck in 2025!
